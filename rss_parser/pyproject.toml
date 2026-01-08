@@ -1,0 +1,11 @@
+[project]
+name = "rss-parser"
+version = "0.1.0"
+description = "RSS feed parser that downloads podcasts and uploads to GCS"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "feedparser>=6.0.0",
+    "requests>=2.31.0",
+    "google-cloud-storage>=2.14.0",
+]
