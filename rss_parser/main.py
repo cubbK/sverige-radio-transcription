@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+from dataclasses import dataclass, asdict
+from typing import Optional
 
 import feedparser
 import requests
@@ -10,141 +12,123 @@ RSS_FEEDS = [
     "https://sr-restored.se/rss/5466"  # Dick Harrison svarar
 ]
 
-# GCS configuration
-GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "sverige-radio-transcription")
-STATE_BLOB_NAME = "_state/rss_state.json"
+
+@dataclass
+class PodcastEpisode:
+    """Represents a single podcast episode extracted from RSS."""
+
+    title: str
+    description: str
+    guid: str
+    pub_date: str
+    mp3_url: str
 
 
-def load_state(bucket: storage.Bucket) -> dict:
-    """Load previously seen episode GUIDs from GCS."""
-    blob = bucket.blob(STATE_BLOB_NAME)
-    try:
-        if blob.exists():
-            content = blob.download_as_text()
-            return json.loads(content)
-    except Exception as e:
-        print(f"Warning: Could not load state from GCS: {e}")
-    return {"seen_guids": []}
+@dataclass
+class Feed:
+    title: str
+    podcast_episodes: list[PodcastEpisode]
 
 
-def save_state(bucket: storage.Bucket, state: dict) -> None:
-    """Save seen episode GUIDs to GCS."""
-    blob = bucket.blob(STATE_BLOB_NAME)
-    blob.upload_from_string(
-        json.dumps(state, indent=2), content_type="application/json"
-    )
+def parse_rss_feed(feed_url: str) -> Feed:
+    """
+    Parse an RSS feed and extract all episodes with their MP3 URLs.
+
+    Args:
+        feed_url: URL of the RSS feed to parse
+
+    Returns:
+        List of PodcastEpisode objects
+    """
+    feed = feedparser.parse(feed_url)
+    episodes = []
+
+    feed_title = feed.feed.get("title", "")  # type: ignore
+    for entry in feed.entries:
+        episode = PodcastEpisode(
+            title=entry.get("title", ""),  # type: ignore
+            description=entry.get("description", ""),  # type: ignore
+            guid=entry.get("guid", ""),  # type: ignore
+            pub_date=entry.get("published", ""),  # type: ignore
+            mp3_url=entry.get("enclosures", [{}])[0].get("url", ""),  # type: ignore
+        )
+        episodes.append(episode)
+
+    return Feed(title=feed_title, podcast_episodes=episodes)
 
 
-def get_mp3_url(entry) -> str | None:
-    """Extract MP3 URL from RSS entry."""
-    # Check enclosures first (standard podcast format)
-    for enclosure in entry.get("enclosures", []):
-        url = enclosure.get("url") or enclosure.get("href")
-        if enclosure.get("type", "").startswith("audio/") or (
-            url and url.endswith(".mp3")
-        ):
-            return url
+def fetch_and_process_feeds():
+    """Fetch all RSS feeds and process their episodes."""
 
-    # Check links
-    for link in entry.get("links", []):
-        url = link.get("url") or link.get("href")
-        if link.get("type", "").startswith("audio/") or (url and url.endswith(".mp3")):
-            return url
-
-    return None
-
-
-def upload_to_gcs(
-    bucket: storage.Bucket, mp3_url: str, episode_title: str, feed_title: str
-) -> str | None:
-    """Download MP3 and upload to GCS. Returns GCS path or None on failure."""
-    try:
-        # Create a safe filename
-        safe_feed_title = "".join(
-            c if c.isalnum() or c in " -_" else "_" for c in feed_title
-        ).strip()
-        safe_episode_title = "".join(
-            c if c.isalnum() or c in " -_" else "_" for c in episode_title
-        ).strip()
-
-        # Create unique filename using URL hash
-        url_hash = hashlib.md5(mp3_url.encode()).hexdigest()[:8]
-        blob_name = f"{safe_feed_title}/{safe_episode_title}_{url_hash}.mp3"
-
-        # Check if already uploaded
-        blob = bucket.blob(blob_name)
-        if blob.exists():
-            print(f"  Already in GCS: {blob_name}")
-            return blob_name
-
-        # Download MP3
-        print(f"  Downloading: {mp3_url}")
-        response = requests.get(mp3_url, stream=True, timeout=300)
-        response.raise_for_status()
-
-        # Upload to GCS
-        print(f"  Uploading to GCS: {blob_name}")
-        blob.upload_from_string(response.content, content_type="audio/mpeg")
-
-        return blob_name
-    except Exception as e:
-        print(f"  Error uploading {mp3_url}: {e}")
-        return None
-
-
-def fetch_and_process_feeds() -> None:
-    """Fetch RSS feeds, find new episodes, and upload MP3s to GCS."""
-    # Initialize GCS client
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(GCS_BUCKET_NAME)
-
-    state = load_state(bucket)
-    seen_guids = set(state.get("seen_guids", []))
-    new_guids = []
+    feeds: list[Feed] = []
 
     for feed_url in RSS_FEEDS:
-        print(f"\nProcessing feed: {feed_url}")
+        print(f"Fetching feed: {feed_url}")
+        feed = parse_rss_feed(feed_url)
 
-        try:
-            feed = feedparser.parse(feed_url)
-            feed_title = feed.get("title", "Unknown Feed")
-            print(f"Feed title: {feed_title}")
-            print(f"Found {len(feed.entries)} entries")
+        feeds.extend([feed])
 
-            for entry in feed.entries:
-                guid = entry.get("id") or entry.get("link") or entry.get("title")
+    return feeds
 
-                if guid in seen_guids:
-                    continue
 
-                title = entry.get("title", "Unknown Episode")
-                print(f"\nNew episode: {title}")
+def upload_to_gcs(feeds: list[Feed], bucket_name: str, blob_name: str):
+    """
+    Upload feeds as JSON to Google Cloud Storage.
 
-                mp3_url = get_mp3_url(entry)
-                if mp3_url:
-                    gcs_path = upload_to_gcs(bucket, mp3_url, title, feed_title)  # type: ignore
-                    if gcs_path:
-                        print(f"  Stored at: gs://{GCS_BUCKET_NAME}/{gcs_path}")
-                else:
-                    print(f"  No MP3 found for this entry")
+    Args:
+        feeds: List of Feed objects to upload
+        bucket_name: Name of the GCS bucket
+        blob_name: Name of the blob (e.g., 'feeds.json')
+    """
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
 
-                new_guids.append(guid)
+    # Convert feeds to JSON
+    feeds_data = [asdict(feed) for feed in feeds]
+    json_data = json.dumps(feeds_data, indent=2, ensure_ascii=False)
 
-        except Exception as e:
-            print(f"Error processing feed {feed_url}: {e}")
+    # Upload the JSON blob
+    blob.upload_from_string(json_data, content_type="application/json")
+    print(f"Uploaded {blob_name} to bucket {bucket_name}")
 
-    # Update state with new guids
-    if new_guids:
-        state["seen_guids"] = list(seen_guids | set(new_guids))
-        save_state(bucket, state)
-        print(f"\nProcessed {len(new_guids)} new episodes")
-    else:
-        print("\nNo new episodes found")
+
+def list_files_in_folder(bucket_name: str, folder_prefix: str) -> list[str]:
+    """
+    List all files in a GCS folder.
+
+    Args:
+        bucket_name: Name of the GCS bucket
+        folder_prefix: Folder path (e.g., 'my-folder/' or 'parent/child/')
+
+    Returns:
+        List of blob names
+    """
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+
+    # List all blobs with the given prefix
+    blobs = bucket.list_blobs(prefix=folder_prefix)
+
+    return [blob.name for blob in blobs]
+
+
+# Example usage:
 
 
 def main():
-    print("RSS Parser - Fetching feeds and uploading to GCS")
-    fetch_and_process_feeds()
+    print("RSS Parser - Fetching feeds and extracting episodes")
+    feeds = fetch_and_process_feeds()
+
+    # Upload to Google Cloud Storage
+    upload_to_gcs(
+        feeds=feeds, bucket_name="sverige-radio-transcription", blob_name="feeds.json"
+    )
+    print("Done uploading feeds.json!")
+
+    files = list_files_in_folder("sverige-radio-transcription", "")
+
+    print("Files in bucket:")
 
 
 if __name__ == "__main__":
