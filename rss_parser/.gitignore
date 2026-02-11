@@ -146,3 +146,12 @@ cython_debug/
 # OS
 .DS_Store
 Thumbs.db
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/tmp/
+*.tfvars
+!*.tfvars.example
