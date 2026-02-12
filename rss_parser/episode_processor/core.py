@@ -13,6 +13,12 @@ from dataclasses import dataclass
 import requests
 
 
+def log(message: str, severity: str = "INFO", **kwargs):
+    """Write a structured JSON log line to stdout for Cloud Logging."""
+    entry = {"message": message, "severity": severity, **kwargs}
+    print(json.dumps(entry, ensure_ascii=False), flush=True)
+
+
 @dataclass
 class PodcastEpisode:
     title: str
@@ -52,9 +58,9 @@ class WhisperTranscriber(Transcriber):
     ):
         from faster_whisper import WhisperModel
 
-        print(f"Loading Whisper model: {model_size} on {device} ({compute_type})")
+        log(f"Loading Whisper model: {model_size} on {device} ({compute_type})")
         self._model = WhisperModel(model_size, device=device, compute_type=compute_type)
-        print("Model loaded successfully")
+        log("Model loaded successfully")
 
     def transcribe(self, audio_path: str) -> TranscriptionResult:
         segments, info = self._model.transcribe(
@@ -139,7 +145,11 @@ class GCSStorage(Storage):
             json.dumps(data, indent=2, ensure_ascii=False),
             content_type="application/json",
         )
-        print(f"Uploaded transcription to gs://{self._bucket.name}/{blob_path}")
+        log(
+            f"Uploaded transcription to gs://{self._bucket.name}/{blob_path}",
+            blob_path=blob_path,
+            episode_guid=episode.guid,
+        )
         return blob_path
 
 
@@ -174,7 +184,7 @@ class LocalStorage(Storage):
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        print(f"Wrote transcription to {path}")
+        log(f"Wrote transcription to {path}", path=path, episode_guid=episode.guid)
         return path
 
 
@@ -215,18 +225,25 @@ class EpisodeProcessor:
         self.storage = storage
         self.downloader = downloader
 
-    def process(self, episode: PodcastEpisode) -> str:
+    def process(self, episode: PodcastEpisode, trace_id: str = "") -> str:
+        log_ctx = {"trace_id": trace_id, "episode_guid": episode.guid}
         with tempfile.TemporaryDirectory() as tmpdir:
             mp3_path = os.path.join(tmpdir, "episode.mp3")
 
-            print(f"Downloading: {episode.mp3_url}")
+            log(f"Downloading: {episode.mp3_url}", **log_ctx)
             self.downloader.download(episode.mp3_url, mp3_path)
             size_mb = os.path.getsize(mp3_path) / (1024 * 1024)
-            print(f"Downloaded ({size_mb:.1f} MB)")
+            log(f"Downloaded ({size_mb:.1f} MB)", size_mb=round(size_mb, 1), **log_ctx)
 
-            print("Transcribing…")
+            log("Transcribing…", **log_ctx)
             result = self.transcriber.transcribe(mp3_path)
-            print(f"Done: {result.duration:.1f}s of audio")
+            log(
+                f"Done: {result.duration:.1f}s of audio",
+                duration=result.duration,
+                language=result.language,
+                **log_ctx,
+            )
 
         path = self.storage.upload_transcription(episode, result)
+        log(f"Stored transcription: {path}", output_path=path, **log_ctx)
         return path

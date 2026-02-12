@@ -12,6 +12,7 @@ from core import (
     GCSStorage,
     LocalStorage,
     HTTPDownloader,
+    log,
 )
 
 app = Flask(__name__)
@@ -22,7 +23,7 @@ app = Flask(__name__)
 USE_FAKE = os.getenv("FAKE_MODE", "").lower() in ("1", "true", "yes")
 
 if USE_FAKE:
-    print("*** FAKE MODE — no GPU, no GCS, instant results ***")
+    log("*** FAKE MODE — no GPU, no GCS, instant results ***")
     transcriber = FakeTranscriber()
     storage = LocalStorage(output_dir=os.getenv("OUTPUT_DIR", "output"))
 else:
@@ -48,14 +49,26 @@ def process_episode():
     if not episode_data:
         return Response("No episode data provided", status=400)
 
+    # Extract trace_id before building the episode (it's not a PodcastEpisode field)
+    trace_id = episode_data.pop("trace_id", "")
+
     episode = PodcastEpisode(**episode_data)
-    print(f"Processing episode: {episode.title}")
+    log(
+        f"Processing episode: {episode.title}",
+        trace_id=trace_id,
+        episode_guid=episode.guid,
+    )
 
     try:
-        path = processor.process(episode)
+        path = processor.process(episode, trace_id=trace_id)
         return Response(f"Processed: {episode.title} → {path}", status=200)
     except Exception as e:
-        print(f"Error processing {episode.title}: {e}")
+        log(
+            f"Error processing {episode.title}: {e}",
+            severity="ERROR",
+            trace_id=trace_id,
+            episode_guid=episode.guid,
+        )
         return Response(f"Error: {e}", status=500)
 
 

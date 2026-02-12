@@ -1,11 +1,20 @@
 import json
 import os
+import sys
+import uuid
 from dataclasses import dataclass, asdict
 
 import feedparser
 import flask
 import functions_framework
 from google.cloud import storage, tasks_v2
+
+
+def log(message: str, severity: str = "INFO", **kwargs):
+    """Write a structured JSON log line to stdout for Cloud Logging."""
+    entry = {"message": message, "severity": severity, **kwargs}
+    print(json.dumps(entry, ensure_ascii=False), flush=True)
+
 
 RSS_FEEDS = [
     "https://sr-restored.se/rss/5466"  # Dick Harrison svarar
@@ -62,7 +71,7 @@ def fetch_and_process_feeds():
     feeds: list[Feed] = []
 
     for feed_url in RSS_FEEDS:
-        print(f"Fetching feed: {feed_url}")
+        log(f"Fetching feed: {feed_url}", feed_url=feed_url)
         feed = parse_rss_feed(feed_url)
 
         feeds.extend([feed])
@@ -89,7 +98,7 @@ def upload_to_gcs(feeds: list[Feed], bucket_name: str, blob_name: str):
 
     # Upload the JSON blob
     blob.upload_from_string(json_data, content_type="application/json")
-    print(f"Uploaded {blob_name} to bucket {bucket_name}")
+    log(f"Uploaded {blob_name} to bucket {bucket_name}", blob_name=blob_name)
 
 
 def fetch_existing_feeds() -> list[dict]:
@@ -98,7 +107,7 @@ def fetch_existing_feeds() -> list[dict]:
     bucket = client.bucket("sverige-radio-transcription")
     blob = bucket.blob("feeds.json")
     if not blob.exists():
-        print("No existing feeds found in GCS.")
+        log("No existing feeds found in GCS.")
         return []
     data = blob.download_as_text()
     feeds_json = json.loads(data)
@@ -135,6 +144,7 @@ def dispatch_to_cloud_tasks(
     queue: str,
     location: str,
     episode: PodcastEpisode,
+    trace_id: str,
 ):
     """
     Dispatch a Cloud Task for a new podcast episode.
@@ -144,12 +154,14 @@ def dispatch_to_cloud_tasks(
         queue: Cloud Tasks queue name
         location: Queue location (e.g., 'europe-west1')
         episode: PodcastEpisode object to process
+        trace_id: Correlation ID for tracing the request across services
     """
     client = tasks_v2.CloudTasksClient()
     parent = client.queue_path(project, location, queue)
 
     # Convert episode to dict for JSON serialization
     episode_data = asdict(episode)
+    episode_data["trace_id"] = trace_id
 
     url = os.environ["EPISODE_PROCESSOR_URL"]
 
@@ -168,19 +180,28 @@ def dispatch_to_cloud_tasks(
     }
 
     response = client.create_task(request={"parent": parent, "task": task})
-    print(f"Dispatched task for episode: {episode.title}")
-    print(f"Task name: {response.name}")
+    log(
+        f"Dispatched task for episode: {episode.title}",
+        trace_id=trace_id,
+        episode_guid=episode.guid,
+        task_name=response.name,
+    )
 
 
 def main():
-    print("RSS Parser - Fetching feeds and extracting episodes")
+    trace_id = str(uuid.uuid4())
+    log("RSS Parser - Fetching feeds and extracting episodes", trace_id=trace_id)
     feeds = fetch_and_process_feeds()
 
     existing_feeds: list[dict] = fetch_existing_feeds()
 
     # Identify new episodes
     new_episodes = identify_new_episodes(feeds, existing_feeds)
-    print(f"Found {len(new_episodes)} new episodes")
+    log(
+        f"Found {len(new_episodes)} new episodes",
+        trace_id=trace_id,
+        count=len(new_episodes),
+    )
 
     # Dispatch Cloud Task for each new episode
     if new_episodes:
@@ -190,9 +211,14 @@ def main():
 
         for episode in new_episodes:
             try:
-                dispatch_to_cloud_tasks(project, queue, location, episode)
+                dispatch_to_cloud_tasks(project, queue, location, episode, trace_id)
             except Exception as e:
-                print(f"Error dispatching task for {episode.title}: {e}")
+                log(
+                    f"Error dispatching task for {episode.title}: {e}",
+                    severity="ERROR",
+                    trace_id=trace_id,
+                    episode_guid=episode.guid,
+                )
 
     # Upload to Google Cloud Storage
     upload_to_gcs(
