@@ -4,7 +4,7 @@ terraform {
   required_providers {
     google = {
       source  = "hashicorp/google"
-      version = "~> 5.0"
+      version = "~> 6.0"
     }
   }
 }
@@ -26,6 +26,7 @@ resource "google_project_service" "apis" {
     "run.googleapis.com",
     "storage.googleapis.com",
     "iam.googleapis.com",
+    "artifactregistry.googleapis.com",
   ])
 
   project            = var.project_id
@@ -178,6 +179,7 @@ data "archive_file" "rss_parser_source" {
 
   excludes = [
     "terraform",
+    "episode_processor",
     ".venv",
     ".vscode",
     "downloaded_mp3s",
@@ -219,7 +221,7 @@ resource "google_cloudfunctions2_function" "rss_parser" {
       GCP_PROJECT_ID               = var.project_id
       CLOUD_TASKS_QUEUE            = var.cloud_tasks_queue_name
       CLOUD_TASKS_LOCATION         = var.region
-      EPISODE_PROCESSOR_URL        = google_cloudfunctions2_function.episode_processor.url
+      EPISODE_PROCESSOR_URL        = google_cloud_run_v2_service.episode_processor.uri
       GOOGLE_CLOUD_SERVICE_ACCOUNT = google_service_account.rss_parser.email
     }
   }
@@ -234,46 +236,88 @@ resource "google_cloudfunctions2_function" "rss_parser" {
 }
 
 # ------------------------------------------------------------------
-# Cloud Function: Episode Processor (target for Cloud Tasks)
+# Artifact Registry for the episode processor container image
 # ------------------------------------------------------------------
+resource "google_artifact_registry_repository" "episode_processor" {
+  location      = var.region
+  repository_id = "episode-processor"
+  format        = "DOCKER"
 
-# Placeholder — you'll add your processing code here later.
-# For now this creates the function stub that receives episode data.
-resource "google_cloudfunctions2_function" "episode_processor" {
-  name     = "episode-processor"
-  location = var.region
+  depends_on = [google_project_service.apis]
+}
 
-  build_config {
-    runtime     = "python312"
-    entry_point = "process_episode"
-    source {
-      storage_source {
-        bucket = google_storage_bucket.feeds.name
-        object = google_storage_bucket_object.rss_parser_source.name
+# ------------------------------------------------------------------
+# Cloud Run: Episode Processor (Whisper transcription with GPU)
+# ------------------------------------------------------------------
+# Build & push the image BEFORE running terraform apply:
+#   cd episode_processor && ./build.sh
+resource "google_cloud_run_v2_service" "episode_processor" {
+  name                = "episode-processor"
+  location            = var.region
+  ingress             = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  deletion_protection = false
+
+  template {
+    execution_environment = "EXECUTION_ENVIRONMENT_GEN2"
+
+    containers {
+      image = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.episode_processor.repository_id}/episode-processor:latest"
+
+      ports {
+        container_port = 8080
+      }
+
+      resources {
+        limits = {
+          cpu              = "4"
+          memory           = "16Gi"
+          "nvidia.com/gpu" = "1"
+        }
+      }
+
+      env {
+        name  = "GCS_BUCKET"
+        value = var.bucket_name
+      }
+      env {
+        name  = "WHISPER_MODEL_SIZE"
+        value = "large-v3"
+      }
+      env {
+        name  = "WHISPER_DEVICE"
+        value = "cuda"
+      }
+      env {
+        name  = "WHISPER_COMPUTE_TYPE"
+        value = "float16"
       }
     }
-  }
 
-  service_config {
-    max_instance_count    = 5
-    available_memory      = "512Mi"
-    timeout_seconds       = 540
-    service_account_email = google_service_account.episode_processor.email
+    node_selector {
+      accelerator = "nvidia-l4"
+    }
+
+    gpu_zonal_redundancy_disabled = true
+
+    scaling {
+      min_instance_count = 0
+      max_instance_count = 3
+    }
+
+    timeout         = "900s"
+    service_account = google_service_account.episode_processor.email
   }
 
   depends_on = [
     google_project_service.apis,
-    google_project_iam_member.cloudbuild_logs,
-    google_project_iam_member.cloudbuild_artifacts,
-    google_project_iam_member.cloudbuild_storage,
-    google_project_iam_member.cloudbuild_builder,
+    google_artifact_registry_repository.episode_processor,
   ]
 }
 
 # Allow Cloud Tasks to invoke the episode processor
 resource "google_cloud_run_service_iam_member" "episode_processor_invoker" {
   location = var.region
-  service  = google_cloudfunctions2_function.episode_processor.name
+  service  = google_cloud_run_v2_service.episode_processor.name
   role     = "roles/run.invoker"
   member   = "serviceAccount:${google_service_account.rss_parser.email}"
 }

@@ -3,9 +3,9 @@ output "rss_parser_function_url" {
   value       = google_cloudfunctions2_function.rss_parser.url
 }
 
-output "episode_processor_function_url" {
-  description = "URL of the episode processor Cloud Function"
-  value       = google_cloudfunctions2_function.episode_processor.url
+output "episode_processor_service_url" {
+  description = "URL of the episode processor Cloud Run service"
+  value       = google_cloud_run_v2_service.episode_processor.uri
 }
 
 output "cloud_tasks_queue" {

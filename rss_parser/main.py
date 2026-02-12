@@ -1,13 +1,10 @@
-import hashlib
 import json
 import os
 from dataclasses import dataclass, asdict
-from typing import Optional
 
 import feedparser
 import flask
 import functions_framework
-import requests
 from google.cloud import storage, tasks_v2
 
 RSS_FEEDS = [
@@ -208,23 +205,6 @@ def rss_parser_entry(request: flask.Request) -> flask.Response:
     """Cloud Function entry point for the RSS parser."""
     main()
     return flask.Response("OK", status=200)
-
-
-@functions_framework.http
-def process_episode(request: flask.Request) -> flask.Response:
-    """Cloud Function entry point for processing a single episode."""
-    episode_data = request.get_json(silent=True)
-    if not episode_data:
-        return flask.Response("No episode data provided", status=400)
-
-    episode = PodcastEpisode(**episode_data)
-    print(f"Processing episode: {episode.title}")
-    print(f"MP3 URL: {episode.mp3_url}")
-
-    # TODO: Add your episode processing logic here
-    # e.g., download MP3, transcribe, store results
-
-    return flask.Response(f"Processed: {episode.title}", status=200)
 
 
 if __name__ == "__main__":
