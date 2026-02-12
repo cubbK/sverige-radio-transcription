@@ -80,6 +80,13 @@ resource "google_project_iam_member" "rss_parser_tasks_enqueuer" {
   member  = "serviceAccount:${google_service_account.rss_parser.email}"
 }
 
+# Allow rss-parser-sa to "act as" itself when creating OIDC-authenticated Cloud Tasks
+resource "google_service_account_iam_member" "rss_parser_act_as_self" {
+  service_account_id = google_service_account.rss_parser.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.rss_parser.email}"
+}
+
 # Cloud Tasks Admin — needed to create the queue
 resource "google_project_iam_member" "rss_parser_tasks_admin" {
   project = var.project_id
